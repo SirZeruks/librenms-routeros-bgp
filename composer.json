@@ -1,0 +1,57 @@
+{
+    "name": "sirzeruks/librenms-routeros-bgp",
+    "description": "LibreNMS plugin: BGP prefix counts for MikroTik RouterOS v7 (collected over REST, API, API-SSL or SSH), shown in the native LibreNMS BGP prefix graphs",
+    "keywords": [
+        "librenms",
+        "librenms-plugin",
+        "mikrotik",
+        "routeros",
+        "bgp"
+    ],
+    "homepage": "https://github.com/SirZeruks/librenms-routeros-bgp",
+    "type": "package",
+    "license": "GPL-3.0-or-later",
+    "authors": [
+        {
+            "name": "SirZeruks",
+            "homepage": "https://github.com/SirZeruks"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/SirZeruks/librenms-routeros-bgp/issues",
+        "docs": "https://github.com/SirZeruks/librenms-routeros-bgp/blob/main/docs/MANUAL.md",
+        "source": "https://github.com/SirZeruks/librenms-routeros-bgp"
+    },
+    "autoload": {
+        "psr-4": {
+            "SirZeruks\\LibrenmsRouterosBgp\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SirZeruks\\LibrenmsRouterosBgp\\Tests\\": "tests/"
+        }
+    },
+    "require": {
+        "php": "^8.2",
+        "librenms/plugin-interfaces": "^1.0",
+        "phpseclib/phpseclib": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5|^11.0"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "SirZeruks\\LibrenmsRouterosBgp\\RouterosBgpProvider"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}
