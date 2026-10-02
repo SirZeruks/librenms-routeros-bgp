@@ -67,51 +67,71 @@ final class Poller
             return $this->remember($device, $result, $write);
         }
 
-        // Peers LibreNMS discovered itself. The plugin's own (IPv6) peers are also in bgpPeers, but they are kept up to
-        // date by ManagedPeers, so they are left out here.
-        $manage = (bool) $this->settings->all()['manage_ipv6'];
-        $owned = ManagedPeers::ownedPeers($device);
-        $peers = BgpPeer::where('device_id', $device->device_id)->get()
-            ->keyBy(fn (BgpPeer $p) => BgpSession::normaliseAddress((string) $p->bgpPeerIdentifier))
-            ->reject(fn (BgpPeer $p, string $ip) => in_array($ip, $owned, true));
+        // One router at a time per device (a manual run and the device poll can overlap): the IPv6 peers the plugin adds
+        // must not be created twice. The lock is only held for the database work, not for reading the router.
+        $process = function () use ($device, $sessions, $write, &$result): int {
+            // Peers LibreNMS discovered itself. The plugin's own (IPv6) peers are also in bgpPeers, but they are kept up to
+            // date by ManagedPeers, so they are left out here.
+            $manage = (bool) $this->settings->all()['manage_ipv6'];
+            $owned = ManagedPeers::owned($device);
+            $ownedBefore = $owned;
+            $ownPeers = ManagedPeers::ownedPeers($device, $owned);
+            $peers = BgpPeer::where('device_id', $device->device_id)->get()
+                ->keyBy(fn (BgpPeer $p) => BgpSession::normaliseAddress((string) $p->bgpPeerIdentifier))
+                ->reject(fn (BgpPeer $p, string $ip) => in_array($ip, $ownPeers, true));
 
-        $keep = [];
-        $result['added'] = 0;
-        foreach ($sessions as $session) {
-            /** @var BgpPeer|null $peer */
-            $peer = $peers->get($session->remoteAddress);
-            $identifier = $peer ? (string) $peer->bgpPeerIdentifier : null;
-            $added = false;
+            $keep = [];
+            $result['added'] = 0;
+            foreach ($sessions as $session) {
+                /** @var BgpPeer|null $peer */
+                $peer = $peers->get($session->remoteAddress);
+                $identifier = $peer ? (string) $peer->bgpPeerIdentifier : null;
+                $added = false;
 
-            // An IPv6 session LibreNMS cannot see over SNMP: the plugin adds it as a BGP peer itself.
-            if ($identifier === null && $manage && $session->afi() === 'ipv6') {
-                $identifier = $write ? ManagedPeers::sync($device, $session) : $session->remoteAddress;
-                $added = $identifier !== null;
-                if ($added) {
-                    $keep[] = $identifier;
-                    $result['added']++;
+                // An IPv6 session LibreNMS cannot see over SNMP: the plugin adds it as a BGP peer itself.
+                if ($identifier === null && $manage && $session->afi() === 'ipv6') {
+                    $identifier = $write ? ManagedPeers::sync($device, $session, $owned) : $session->remoteAddress;
+                    $added = $identifier !== null;
+                    if ($added) {
+                        $keep[] = $identifier;
+                        $result['added']++;
+                    }
+                }
+
+                $result['sessions'][] = [
+                    'name' => $session->name,
+                    'remote' => $session->remoteAddress,
+                    'prefixes' => $session->prefixCount,
+                    'established' => $session->established,
+                    'matched' => $identifier !== null,
+                    'added' => $added,
+                ];
+                if ($identifier === null) {
+                    continue;   // LibreNMS discovery has not seen this peer (yet); nothing to attach the graph to
+                }
+                $result['matched']++;
+                if ($write) {
+                    $this->store($device, $identifier, $session->afi(), $session->prefixCount ?? 0);
                 }
             }
 
-            $result['sessions'][] = [
-                'name' => $session->name,
-                'remote' => $session->remoteAddress,
-                'prefixes' => $session->prefixCount,
-                'established' => $session->established,
-                'matched' => $identifier !== null,
-                'added' => $added,
-            ];
-            if ($identifier === null) {
-                continue;   // LibreNMS discovery has not seen this peer (yet); nothing to attach the graph to
+            // the plugin's peers whose session is gone from the router (or all of them, if the option is off)
+            $removed = $write ? ManagedPeers::prune($device, $manage ? $keep : [], $owned) : 0;
+            if ($write && $owned !== $ownedBefore) {
+                ManagedPeers::saveOwned($device, $owned);
             }
-            $result['matched']++;
-            if ($write) {
-                $this->store($device, $identifier, $session->afi(), $session->prefixCount ?? 0, $added);
-            }
-        }
 
-        // the plugin's peers whose session is gone from the router (or all of them, if the option is off)
-        $removed = $write ? ManagedPeers::prune($device, $manage ? $keep : []) : 0;
+            return $removed;
+        };
+        try {
+            $removed = Cache::lock(RouterosBgpProvider::PLUGIN . '.device.' . $device->device_id, 120)->block(60, $process);
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException) {
+            $result['message'] = 'Another read of this router is still being stored; skipped this one';
+
+            return $this->remember($device, $result, $write);
+        } catch (\BadMethodCallException) {
+            $removed = $process();   // cache store without locks
+        }
 
         $result['ok'] = true;
         $result['message'] = sprintf('%d session(s) read, %d matched to LibreNMS BGP peers', count($sessions), $result['matched'])
@@ -121,7 +141,7 @@ final class Poller
         return $this->remember($device, $result, $write);
     }
 
-    private function store(Device $device, string $peerIdentifier, string $afi, int $accepted, bool $managed = false): void
+    private function store(Device $device, string $peerIdentifier, string $afi, int $accepted): void
     {
         $key = [
             'device_id' => $device->device_id,
@@ -144,9 +164,6 @@ final class Poller
             'WithdrawnPrefixes' => 0, 'WithdrawnPrefixes_prev' => 0, 'WithdrawnPrefixes_delta' => 0,
         ];
         DB::table('bgpPeers_cbgp')->updateOrInsert($key, $cbgp);
-        if ($managed) {
-            ManagedPeers::rememberCbgp($device, $peerIdentifier, $key + $cbgp);
-        }
 
         // Same RRD name and definition as includes/polling/bgp-peers.inc.php, so the core graphs read it.
         $rrdDef = RrdDefinition::make()

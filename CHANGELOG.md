@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-10-02
+
+- Fix: LibreNMS's *Validate* page reported "database schema may be wrong — extra table (routeros_bgp_managed_peers)",
+  and its Fix button would have deleted that table. The plugin no longer creates a table: its record of the IPv6 peers
+  it added now lives in its own settings entry. On update, 0.3.0's table is moved over and dropped automatically
+  (same peer IDs). Validate is clean again.
+- After discovery, IPv6 peers are restored by reading the router again, keeping their IDs and edited descriptions.
+- Two reads of the same router at once (Poll all now and the device poll) can no longer add an IPv6 peer twice.
+- README: an Uninstall section, including how to delete the stored settings and the encrypted router password.
+
 ## 0.3.0 — 2026-10-02
 
 First public release.

@@ -19,7 +19,7 @@ class RouterosBgpProvider extends ServiceProvider
 {
     public const PLUGIN = 'routeros-bgp';
 
-    public const VERSION = '0.3.0';
+    public const VERSION = '0.3.1';
 
     public function register(): void
     {

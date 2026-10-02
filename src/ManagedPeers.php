@@ -4,7 +4,8 @@ namespace SirZeruks\LibrenmsRouterosBgp;
 
 use App\Models\Device;
 use App\Models\Eventlog;
-use Illuminate\Database\Schema\Blueprint;
+use App\Models\Plugin;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -18,64 +19,89 @@ use LibreNMS\RRD\RrdDefinition;
  * - Each such session becomes a normal row in LibreNMS's `bgpPeers` table (state, AS, uptime, messages), so it shows
  *   on the Routing > BGP pages, gets prefix and update graphs, and works with LibreNMS's BGP alert rules. The plugin
  *   writes the same "BGP Session Up/Down" event-log entries the LibreNMS poller writes.
- * - The plugin records which rows it created (its own table) and only ever changes or removes THOSE rows; a peer
- *   LibreNMS discovered itself is never touched.
- * - LibreNMS's discovery deletes BGP peers it did not find itself; the plugin puts its rows back right after each
- *   discovery (DeviceDiscovered), with the same IDs, so links, graphs and alert history stay intact.
+ * - The plugin records which rows it created and only ever changes or removes THOSE rows; a peer LibreNMS discovered
+ *   itself is never touched. The record ("owned") lives in the plugin's own settings row in LibreNMS's `plugins`
+ *   table: per device, peer address => [bgpPeer_id, description]. No extra database table, so LibreNMS's schema
+ *   validation stays clean.
+ * - LibreNMS's discovery deletes BGP peers it did not find itself; right after each discovery the plugin reads the
+ *   router again and puts its rows back with the same IDs (links, graphs and alert history stay intact).
  * - A session that disappears from the router is removed from LibreNMS on the next poll.
  *
  * LibreNMS's own BGP poller skips these rows (it finds no SNMP data for them), so the two never fight over a row.
  */
 final class ManagedPeers
 {
-    public const TABLE = 'routeros_bgp_managed_peers';
+    /** Table used by 0.3.0 for the same record; migrated into the settings and dropped (LibreNMS flags extra tables). */
+    private const LEGACY_TABLE = 'routeros_bgp_managed_peers';
 
-    private static bool $tableReady = false;
+    private static bool $legacyChecked = false;
 
-    public static function ensureTable(): void
+    /**
+     * The plugin's peers on this device, read fresh from the database: address => ['id' => int, 'descr' => string].
+     *
+     * @return array<string, array{id: int, descr: string}>
+     */
+    public static function owned(Device $device): array
     {
-        if (self::$tableReady) {
-            return;
-        }
-        try {
-            if (! Schema::hasTable(self::TABLE)) {
-                Schema::create(self::TABLE, function (Blueprint $t): void {
-                    $t->id();
-                    $t->unsignedInteger('device_id');
-                    $t->string('peer', 64);               // bgpPeerIdentifier
-                    $t->unsignedInteger('bgp_peer_id');   // the bgpPeers row the plugin owns
-                    $t->text('row');                      // last bgpPeers values, to restore after discovery
-                    $t->text('cbgp')->nullable();         // last bgpPeers_cbgp values, to restore after discovery
-                    $t->timestamps();
-                    $t->unique(['device_id', 'peer']);
-                });
-            }
-        } catch (\Throwable $e) {
-            // another poller worker created it at the same moment
-            if (! Schema::hasTable(self::TABLE)) {
-                throw $e;
-            }
-        }
-        self::$tableReady = true;
+        self::migrateLegacyTable();
+
+        return (array) (self::settingsRow()['owned'][(string) $device->device_id] ?? []);
     }
 
     /**
-     * Create or update the bgpPeers row for a session LibreNMS does not know. Returns the peer identifier, or null if
-     * a row for this address exists that the plugin does not own (LibreNMS's own: left alone).
+     * Save this device's record. Locked, and read-modify-write on a FRESH copy of the settings, so poller workers
+     * handling other devices at the same time, or an admin saving the settings page, never lose each other's changes.
+     *
+     * @param  array<string, array{id: int, descr: string}>  $owned
      */
-    public static function sync(Device $device, BgpSession $s): ?string
+    public static function saveOwned(Device $device, array $owned): void
     {
-        self::ensureTable();
+        self::locked(function () use ($device, $owned): void {
+            $plugin = Plugin::where('plugin_name', RouterosBgpProvider::PLUGIN)->first();
+            if (! $plugin) {
+                return;
+            }
+            $settings = (array) $plugin->settings;
+            if ($owned) {
+                $settings['owned'][(string) $device->device_id] = $owned;
+            } else {
+                unset($settings['owned'][(string) $device->device_id]);
+            }
+            $plugin->settings = $settings;
+            $plugin->save();
+        });
+    }
+
+    /**
+     * Addresses of the peers the plugin owns on this device: its record exists and the bgpPeers row for that address
+     * is the plugin's row (or is missing, removed by discovery). A row LibreNMS discovered itself is never "owned".
+     *
+     * @param  array<string, array{id: int, descr: string}>  $owned
+     * @return string[]
+     */
+    public static function ownedPeers(Device $device, array $owned): array
+    {
+        $rows = DB::table('bgpPeers')->where('device_id', $device->device_id)->pluck('bgpPeer_id', 'bgpPeerIdentifier');
+
+        return array_values(array_filter(array_keys($owned), fn (string $peer) => ! isset($rows[$peer]) || (int) $rows[$peer] === (int) $owned[$peer]['id']));
+    }
+
+    /**
+     * Create or update the bgpPeers row for a session LibreNMS does not know, updating $owned. Returns the peer
+     * address, or null if a row for this address exists that the plugin does not own (LibreNMS's own: left alone).
+     *
+     * @param  array<string, array{id: int, descr: string}>  $owned
+     */
+    public static function sync(Device $device, BgpSession $s, array &$owned): ?string
+    {
         $peer = $s->remoteAddress;
-        $own = DB::table(self::TABLE)->where('device_id', $device->device_id)->where('peer', $peer)->first();
+        $own = $owned[$peer] ?? null;
         $existing = DB::table('bgpPeers')->where('device_id', $device->device_id)->where('bgpPeerIdentifier', $peer)->first();
 
-        if ($existing && (! $own || (int) $existing->bgpPeer_id !== (int) $own->bgp_peer_id)) {
+        if ($existing && (! $own || (int) $existing->bgpPeer_id !== (int) $own['id'])) {
             // LibreNMS's own row: never ours to change. If the plugin used to own this address, LibreNMS has taken it
-            // over (it discovers the peer itself now): drop the plugin's record and leave the peer to LibreNMS.
-            if ($own) {
-                DB::table(self::TABLE)->where('id', $own->id)->delete();
-            }
+            // over (it discovers the peer itself now): forget it and leave the peer to LibreNMS.
+            unset($owned[$peer]);
 
             return null;
         }
@@ -85,111 +111,99 @@ final class ManagedPeers
             // keep what an admin may have edited (description) and the looked-up AS name
             unset($values['bgpPeerDescr'], $values['astext']);
             DB::table('bgpPeers')->where('bgpPeer_id', $existing->bgpPeer_id)->update($values);
-            self::logStateChange($device, $s, (string) $existing->bgpPeerState, $existing);
+            self::logStateChange($device, $s, (string) $existing->bgpPeerState, (string) $existing->bgpPeerDescr);
             $id = (int) $existing->bgpPeer_id;
-            $row = array_merge((array) $existing, $values);
+            $descr = (string) $existing->bgpPeerDescr;
         } else {
             $values['astext'] = self::astext($s->remoteAs);
-            if ($own && ! DB::table('bgpPeers')->where('bgpPeer_id', $own->bgp_peer_id)->exists()) {
-                // discovery removed it: put it back with the same ID
-                $previous = (array) json_decode((string) $own->row, true);
-                $values['bgpPeerDescr'] = $previous['bgpPeerDescr'] ?? $values['bgpPeerDescr'];
-                $id = (int) $own->bgp_peer_id;
+            if ($own && ! DB::table('bgpPeers')->where('bgpPeer_id', $own['id'])->exists()) {
+                // discovery removed it: put it back with the same ID and the description it had
+                $values['bgpPeerDescr'] = $own['descr'] !== '' ? $own['descr'] : $values['bgpPeerDescr'];
+                $id = (int) $own['id'];
                 DB::table('bgpPeers')->insert(['bgpPeer_id' => $id] + $values);
             } else {
                 $id = (int) DB::table('bgpPeers')->insertGetId($values, 'bgpPeer_id');
             }
-            $row = ['bgpPeer_id' => $id] + $values;
+            $descr = (string) $values['bgpPeerDescr'];
         }
 
-        DB::table(self::TABLE)->updateOrInsert(
-            ['device_id' => $device->device_id, 'peer' => $peer],
-            ['bgp_peer_id' => $id, 'row' => json_encode($row), 'updated_at' => now(), 'created_at' => $own->created_at ?? now()],
-        );
-
+        $owned[$peer] = ['id' => $id, 'descr' => mb_substr($descr, 0, 255)];
         self::storeUpdatesGraph($device, $s);
 
         return $peer;
     }
 
-    /** Remember the last prefix-count row of a managed peer, to restore it after discovery. */
-    public static function rememberCbgp(Device $device, string $peer, array $cbgpRow): void
-    {
-        self::ensureTable();
-        $own = DB::table(self::TABLE)->where('device_id', $device->device_id)->where('peer', $peer)->first();
-        if ($own) {
-            $all = (array) json_decode((string) ($own->cbgp ?? '[]'), true);
-            $all[$cbgpRow['afi'] . '.' . $cbgpRow['safi']] = $cbgpRow;
-            DB::table(self::TABLE)->where('id', $own->id)->update(['cbgp' => json_encode($all)]);
-        }
-    }
-
     /**
-     * Identifiers of the peers the plugin owns on this device: its record exists and the bgpPeers row for that address
-     * is the plugin's row (or is missing, removed by discovery). A row LibreNMS discovered itself is never "owned".
-     *
-     * @return string[]
-     */
-    public static function ownedPeers(Device $device): array
-    {
-        self::ensureTable();
-        $rows = DB::table('bgpPeers')->where('device_id', $device->device_id)->pluck('bgpPeer_id', 'bgpPeerIdentifier');
-
-        return DB::table(self::TABLE)->where('device_id', $device->device_id)->get()
-            ->filter(fn ($own) => ! isset($rows[$own->peer]) || (int) $rows[$own->peer] === (int) $own->bgp_peer_id)
-            ->pluck('peer')->all();
-    }
-
-    /**
-     * Remove the plugin's rows for sessions that are gone from the router ($keep = identifiers still present).
+     * Remove the plugin's rows for sessions that are gone from the router ($keep = addresses still present).
      *
      * @param  string[]  $keep
+     * @param  array<string, array{id: int, descr: string}>  $owned
      */
-    public static function prune(Device $device, array $keep): int
+    public static function prune(Device $device, array $keep, array &$owned): int
     {
-        self::ensureTable();
         $removed = 0;
-        foreach (DB::table(self::TABLE)->where('device_id', $device->device_id)->whereNotIn('peer', $keep ?: [''])->get() as $own) {
-            DB::table('bgpPeers')->where('bgpPeer_id', $own->bgp_peer_id)->where('bgpPeerIdentifier', $own->peer)->delete();
-            DB::table('bgpPeers_cbgp')->where('device_id', $device->device_id)->where('bgpPeerIdentifier', $own->peer)->delete();
-            DB::table(self::TABLE)->where('id', $own->id)->delete();
+        foreach (array_diff(array_keys($owned), $keep) as $peer) {
+            DB::table('bgpPeers')->where('bgpPeer_id', $owned[$peer]['id'])->where('bgpPeerIdentifier', $peer)->delete();
+            DB::table('bgpPeers_cbgp')->where('device_id', $device->device_id)->where('bgpPeerIdentifier', $peer)->delete();
+            unset($owned[$peer]);
             $removed++;
         }
 
         return $removed;
     }
 
-    /** After LibreNMS's discovery: put back any of the plugin's rows it removed (same IDs), with their prefix counts. */
-    public static function restore(Device $device): int
+    /** One plugin-wide lock for writes to the plugin's settings row (the record and the settings page). */
+    public static function locked(callable $fn): mixed
     {
-        self::ensureTable();
-        $restored = 0;
-        foreach (DB::table(self::TABLE)->where('device_id', $device->device_id)->get() as $own) {
-            if (DB::table('bgpPeers')->where('bgpPeer_id', $own->bgp_peer_id)->exists()) {
-                continue;
-            }
-            $row = (array) json_decode((string) $own->row, true);
-            if (! $row || DB::table('bgpPeers')->where('device_id', $device->device_id)->where('bgpPeerIdentifier', $own->peer)->exists()) {
-                continue;   // LibreNMS now knows this peer itself: leave it to LibreNMS
-            }
-            $row['bgpPeer_id'] = (int) $own->bgp_peer_id;
-            DB::table('bgpPeers')->insert(array_intersect_key($row, array_flip(self::COLUMNS)));
-            foreach ((array) json_decode((string) ($own->cbgp ?? '[]'), true) as $cbgp) {
-                DB::table('bgpPeers_cbgp')->updateOrInsert(
-                    ['device_id' => $device->device_id, 'bgpPeerIdentifier' => $own->peer, 'afi' => $cbgp['afi'], 'safi' => $cbgp['safi']],
-                    array_diff_key($cbgp, array_flip(['device_id', 'bgpPeerIdentifier', 'afi', 'safi'])),
-                );
-            }
-            $restored++;
+        try {
+            $lock = Cache::lock(RouterosBgpProvider::PLUGIN . '.settings-lock', 30);
+            return $lock->block(15, $fn);
+        } catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {
+            throw $e;
+        } catch (\Throwable) {
+            return $fn();   // cache store without locks: write anyway
         }
-
-        return $restored;
     }
 
-    private const COLUMNS = ['bgpPeer_id', 'device_id', 'vrf_id', 'astext', 'bgpPeerIdentifier', 'bgpPeerRemoteAs', 'bgpPeerState',
-        'bgpPeerAdminStatus', 'bgpPeerLastErrorCode', 'bgpPeerLastErrorSubCode', 'bgpPeerLastErrorText', 'bgpPeerIface',
-        'bgpLocalAddr', 'bgpPeerRemoteAddr', 'bgpPeerDescr', 'bgpPeerInUpdates', 'bgpPeerOutUpdates', 'bgpPeerInTotalMessages',
-        'bgpPeerOutTotalMessages', 'bgpPeerFsmEstablishedTime', 'bgpPeerInUpdateElapsedTime', 'context_name'];
+    /** @return array<string, mixed> the plugin's settings, read fresh (no in-process cache) */
+    private static function settingsRow(): array
+    {
+        return (array) (Plugin::where('plugin_name', RouterosBgpProvider::PLUGIN)->value('settings') ?? []);
+    }
+
+    /** 0.3.0 kept the record in its own table, which LibreNMS's schema validation reports as a failure: move and drop it. */
+    private static function migrateLegacyTable(): void
+    {
+        if (self::$legacyChecked) {
+            return;
+        }
+        self::$legacyChecked = true;
+        try {
+            if (! Schema::hasTable(self::LEGACY_TABLE)) {
+                return;
+            }
+            $byDevice = [];
+            foreach (DB::table(self::LEGACY_TABLE)->get() as $r) {
+                $row = (array) json_decode((string) ($r->row ?? ''), true);
+                $byDevice[(string) $r->device_id][$r->peer] = ['id' => (int) $r->bgp_peer_id, 'descr' => (string) ($row['bgpPeerDescr'] ?? '')];
+            }
+            self::locked(function () use ($byDevice): void {
+                $plugin = Plugin::where('plugin_name', RouterosBgpProvider::PLUGIN)->first();
+                if ($plugin && $byDevice) {
+                    $settings = (array) $plugin->settings;
+                    foreach ($byDevice as $deviceId => $peers) {
+                        $settings['owned'][$deviceId] = array_merge((array) ($settings['owned'][$deviceId] ?? []), $peers);
+                    }
+                    $plugin->settings = $settings;
+                    $plugin->save();
+                }
+            });
+            Schema::drop(self::LEGACY_TABLE);
+            Log::info('routeros-bgp: moved the IPv6 peer record into the plugin settings and dropped table ' . self::LEGACY_TABLE);
+        } catch (\Throwable $e) {
+            Log::error('routeros-bgp: could not migrate ' . self::LEGACY_TABLE . ': ' . $e->getMessage());
+        }
+    }
 
     /** @return array<string, mixed> */
     private static function values(Device $device, BgpSession $s): array
@@ -222,13 +236,13 @@ final class ManagedPeers
     }
 
     /** The same event-log entries LibreNMS's BGP poller writes, so alerting and the event log behave the same. */
-    private static function logStateChange(Device $device, BgpSession $s, string $previous, object $row): void
+    private static function logStateChange(Device $device, BgpSession $s, string $previous, string $descr): void
     {
         $now = $s->established ? 'established' : 'idle';
         if ($previous === $now) {
             return;
         }
-        $what = sprintf('%s (AS%s %s)', $s->remoteAddress, $s->remoteAs ?? $row->bgpPeerRemoteAs, $row->bgpPeerDescr);
+        $what = sprintf('%s (AS%s %s)', $s->remoteAddress, $s->remoteAs ?? '?', $descr);
         if ($now === 'established') {
             Eventlog::log('BGP Session Up: ' . $what, $device, 'bgpPeer', Severity::Ok, $s->remoteAddress);
         } elseif ($previous === 'established') {

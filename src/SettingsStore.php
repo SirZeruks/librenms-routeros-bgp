@@ -49,7 +49,15 @@ final class SettingsStore
      */
     public function save(array $settings): void
     {
-        $this->manager->setSettings(RouterosBgpProvider::PLUGIN, $settings);
+        // keep the plugin's record of the IPv6 peers it added (ManagedPeers), which the settings page does not edit;
+        // read fresh and write under the same lock the pollers use, so neither side overwrites the other
+        ManagedPeers::locked(function () use ($settings): void {
+            $current = (array) (\App\Models\Plugin::where('plugin_name', RouterosBgpProvider::PLUGIN)->value('settings') ?? []);
+            if (isset($current['owned'])) {
+                $settings['owned'] = $current['owned'];
+            }
+            $this->manager->setSettings(RouterosBgpProvider::PLUGIN, $settings);
+        });
     }
 
     /**

@@ -390,9 +390,11 @@ The prefix counts already stored stay in LibreNMS (they no longer update). To re
    Only do this for the MikroTik hostnames listed in step 1.
 
 3. IPv6 peers the plugin added stay in LibreNMS until its next discovery of each router, which removes them
-   (LibreNMS cannot see them itself). The plugin's own bookkeeping table can be dropped in the database console:
+   (LibreNMS cannot see them itself).
+4. The plugin's settings stay in LibreNMS's `plugins` table after removal (so a reinstall picks up where you left
+   off). They include the **encrypted router password**. To delete them, in `sudo -u librenms ./lnms db`:
    ```sql
-   DROP TABLE IF EXISTS routeros_bgp_managed_peers;
+   DELETE FROM plugins WHERE plugin_name = 'routeros-bgp';
    ```
 
 Then remove the read-only user from your routers if you no longer need it:
@@ -425,11 +427,12 @@ so on its own LibreNMS never shows a MikroTik IPv6 BGP session. With **Add IPv6 
 
 How it stays out of LibreNMS's way:
 
-- The plugin records which peers it added (table `routeros_bgp_managed_peers`) and only ever changes or removes
-  those. A peer LibreNMS discovered itself is never touched; if LibreNMS ever starts discovering a peer itself, the
+- The plugin records which peers it added (in its own settings entry in LibreNMS's plugins table, so it adds no
+  database tables and LibreNMS's *Validate* page stays clean) and only ever changes or removes those. A peer LibreNMS discovered itself is never touched; if LibreNMS ever starts discovering a peer itself, the
   plugin hands it over.
-- LibreNMS's discovery removes peers it did not find itself. The plugin puts its peers back right after each
-  discovery, **with the same IDs**, so links, graphs and alert history are kept.
+- LibreNMS's discovery removes peers it did not find itself. Right after each discovery the plugin reads the router
+  again and puts its peers back **with the same IDs** and your edited descriptions, so links, graphs and alert history
+  are kept.
 - A session that disappears from the router is removed from LibreNMS on the next poll. Unticking the option removes
   all the plugin's IPv6 peers on the next poll.
 - Routers with only IPv6 sessions are included: the plugin reads every RouterOS device on which LibreNMS has found

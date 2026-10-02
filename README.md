@@ -83,6 +83,32 @@ The plugin survives LibreNMS's nightly updates: LibreNMS re-installs user plugin
 **The full step-by-step guide, router preparation for every connection method, custom ports,
 troubleshooting and uninstall are in the [manual](docs/MANUAL.md).**
 
+## Uninstall
+
+Changed your mind? One command removes it, the same way it was installed:
+
+```bash
+sudo bash install.sh --uninstall
+```
+
+Or by hand, as the LibreNMS user:
+
+```bash
+cd /opt/librenms
+sudo -u librenms ./lnms plugin:remove sirzeruks/librenms-routeros-bgp
+sudo -u librenms php artisan route:cache
+sudo -u librenms php artisan view:clear
+```
+
+LibreNMS keeps running normally; the plugin's pages and its part of the device poll are gone. Left behind, by design:
+
+| What | How to remove it |
+|---|---|
+| Stored prefix counts and prefix graphs | [Manual, section 10](docs/MANUAL.md#10-update-disable-uninstall) |
+| IPv6 peers the plugin added | removed automatically at LibreNMS's next discovery of each router |
+| The plugin's settings, **including the encrypted router password** | in `sudo -u librenms ./lnms db`: `DELETE FROM plugins WHERE plugin_name = 'routeros-bgp';` |
+| The read-only user on your routers | `/user remove [find name=librenms]` and `/user group remove [find name=librenms-read]` |
+
 ## How it works
 
 ```
