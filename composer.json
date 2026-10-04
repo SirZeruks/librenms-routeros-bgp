@@ -35,7 +35,7 @@
     "require": {
         "php": "^8.2",
         "librenms/plugin-interfaces": "^1.0",
-        "phpseclib/phpseclib": "^3.0"
+        "phpseclib/phpseclib": "^3.0 || ^4.0"
     },
     "require-dev": {
         "phpunit/phpunit": "^10.5|^11.0"

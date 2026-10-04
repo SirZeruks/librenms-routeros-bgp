@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 — 2026-10-04
+
+- Fix: the plugin could not be installed or updated on LibreNMS master, which now ships phpseclib 4 (via
+  laravel/socialite): `lnms plugin:add` and the nightly `daily.sh` stopped with a dependency conflict (issue #1).
+  The plugin now accepts phpseclib 3 or 4, and the SSH transport works with either version.
+
 ## 0.3.1 — 2026-10-02
 
 - Fix: LibreNMS's *Validate* page reported "database schema may be wrong — extra table (routeros_bgp_managed_peers)",

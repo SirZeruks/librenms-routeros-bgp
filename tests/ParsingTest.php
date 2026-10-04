@@ -132,4 +132,13 @@ class ParsingTest extends TestCase
         $this->assertSame('a=b', $r['attrs']['name']);
         $this->assertSame('10.0.0.1', $r['attrs']['remote.address']);
     }
+
+    public function testSshTransportPicksTheInstalledPhpseclib(): void
+    {
+        $lib = SshTransport::phpseclib();
+        $this->assertTrue(class_exists($lib['ssh']), 'the SSH2 class it names exists');
+        $this->assertTrue(class_exists($lib['loader']), 'the PublicKeyLoader class it names exists');
+        // phpseclib 4 takes null for "no key passphrase", phpseclib 3 takes false
+        $this->assertSame(str_starts_with($lib['ssh'], 'phpseclib4\\') ? null : false, $lib['noPassphrase']);
+    }
 }

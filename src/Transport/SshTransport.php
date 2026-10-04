@@ -2,8 +2,6 @@
 
 namespace SirZeruks\LibrenmsRouterosBgp\Transport;
 
-use phpseclib3\Crypt\PublicKeyLoader;
-use phpseclib3\Net\SSH2;
 use SirZeruks\LibrenmsRouterosBgp\BgpSession;
 
 /**
@@ -31,15 +29,34 @@ final class SshTransport implements Transport
     {
     }
 
+    /**
+     * phpseclib 3 and 4 are both supported (LibreNMS moved to 4). They differ in namespace (phpseclib3\ vs phpseclib4\)
+     * and in how "no key passphrase" is passed to PublicKeyLoader::load (false in 3, null in 4).
+     *
+     * @return array{ssh: class-string, loader: class-string, noPassphrase: false|null}
+     */
+    public static function phpseclib(): array
+    {
+        if (class_exists('phpseclib4\\Net\\SSH2')) {
+            return ['ssh' => 'phpseclib4\\Net\\SSH2', 'loader' => 'phpseclib4\\Crypt\\PublicKeyLoader', 'noPassphrase' => null];
+        }
+        if (class_exists('phpseclib3\\Net\\SSH2')) {
+            return ['ssh' => 'phpseclib3\\Net\\SSH2', 'loader' => 'phpseclib3\\Crypt\\PublicKeyLoader', 'noPassphrase' => false];
+        }
+
+        throw new TransportException('SSH is not available: phpseclib 3 or 4 is not installed');
+    }
+
     public function fetchSessions(): array
     {
-        $ssh = new SSH2($this->config->host, $this->config->port, $this->config->timeout);
+        $lib = self::phpseclib();
+        $ssh = new $lib['ssh']($this->config->host, $this->config->port, $this->config->timeout);
         $ssh->setTimeout($this->config->timeout);
 
         try {
             $credential = $this->config->password;
             if ($this->config->sshKey !== '') {
-                $credential = PublicKeyLoader::load($this->config->sshKey, $this->config->password !== '' ? $this->config->password : false);
+                $credential = $lib['loader']::load($this->config->sshKey, $this->config->password !== '' ? $this->config->password : $lib['noPassphrase']);
             }
             if (! $ssh->login($this->config->username, $credential)) {
                 throw new TransportException('SSH login refused: check the username/password/key and that the user group has the ssh policy');
